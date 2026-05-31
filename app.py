@@ -291,10 +291,27 @@ class ExtractWorker(threading.Thread):
                     self.result_queue.put(('failed', self.task_item.task_id, '文件未找到'))
 
         except Exception as e:
-            error_msg = str(e)
-            if len(error_msg) > 50:
-                error_msg = error_msg[:47] + "..."
-            self.result_queue.put(('failed', self.task_item.task_id, error_msg))
+            self.result_queue.put(('failed', self.task_item.task_id, self.friendly_error(str(e))))
+
+    def friendly_error(self, raw):
+        """把yt-dlp的常见英文报错转成可操作的中文提示"""
+        low = raw.lower()
+        if "unsupported url" in low:
+            return "不支持的链接（请用单个视频页地址，非搜索/主页）"
+        if "fresh cookies" in low or "cookies" in low and "needed" in low:
+            return "需要cookies：请在下方选择浏览器并关闭它后重试"
+        if "sign in" in low or "login" in low or "private" in low:
+            return "需要登录：请在下方选择浏览器cookies后重试"
+        if "ffmpeg" in low:
+            return "ffmpeg错误：请确认ffmpeg可用"
+        if "http error 404" in low or "not found" in low:
+            return "视频不存在或已删除(404)"
+        if "geo" in low and "restrict" in low:
+            return "该视频有地区限制"
+        if "timed out" in low or "timeout" in low or "connection" in low:
+            return "网络超时，请检查网络或重试"
+        # 其余错误截断显示
+        return raw[:47] + "..." if len(raw) > 50 else raw
 
     def progress_hook(self, d):
         """yt-dlp进度回调"""
@@ -628,6 +645,43 @@ class App:
         Config.save(self.config)
         self.update_status("设置已保存")
 
+    def check_unsupported_page(self, url):
+        """检测明显不是单个视频页的URL（搜索/用户主页等），返回提示文字或None"""
+        low = url.lower()
+        # 各平台的非视频页特征：搜索页、发现页、用户主页等
+        bad_patterns = [
+            ("douyin.com/search", "抖音搜索结果页"),
+            ("douyin.com/jingxuan", "抖音精选/推荐页"),
+            ("douyin.com/discover", "抖音发现页"),
+            ("douyin.com/user/", "抖音用户主页"),
+            ("bilibili.com/v/", "B站分区页"),
+            ("search.bilibili.com", "B站搜索页"),
+            ("youtube.com/results", "YouTube搜索结果页"),
+            ("youtube.com/feed", "YouTube订阅/首页"),
+            ("/search?", "搜索结果页"),
+            ("/search/", "搜索结果页"),
+        ]
+        for pat, desc in bad_patterns:
+            if pat in low:
+                return desc
+        return None
+
+    def check_needs_cookies(self, url):
+        """检测是否为通常需要cookies的平台(抖音/微博等)，返回平台名或None"""
+        low = url.lower()
+        cookie_platforms = [
+            ("douyin.com", "抖音"),
+            ("v.douyin.com", "抖音"),
+            ("weibo.com", "微博"),
+            ("weibo.cn", "微博"),
+            ("xiaohongshu.com", "小红书"),
+            ("kuaishou.com", "快手"),
+        ]
+        for domain, name in cookie_platforms:
+            if domain in low:
+                return name
+        return None
+
     def add_task(self):
         """添加提取任务"""
         urls_text = self.url_entry.get().strip()
@@ -638,11 +692,34 @@ class App:
         # 支持多行URL
         urls = [url.strip() for url in urls_text.split('\n') if url.strip()]
 
+        cookie_warned = False  # 同一批只提醒一次cookies
         for url in urls:
             # 验证URL格式
             if not url.startswith(('http://', 'https://')):
                 messagebox.showwarning("提示", f"无效的URL: {url}")
                 continue
+
+            # 改进1：粘贴时检测非视频页（搜索/主页等），提前拦截
+            bad = self.check_unsupported_page(url)
+            if bad:
+                if not messagebox.askyesno(
+                    "可能不是视频链接",
+                    f"这看起来是「{bad}」，不是单个视频页面。\n\n"
+                    "请点进某个具体视频，复制地址栏里 .../video/数字 形式的链接。\n\n"
+                    "仍要尝试提取吗？"
+                ):
+                    continue
+
+            # 改进2：抖音/微博等平台未选cookies时提醒
+            need = self.check_needs_cookies(url)
+            if need and self.cookies_var.get() == "none" and not cookie_warned:
+                cookie_warned = True
+                messagebox.showinfo(
+                    "提示",
+                    f"{need} 通常需要浏览器 cookies 才能提取。\n\n"
+                    "请在下方「登录cookies」选择你常用的浏览器"
+                    "（如 chrome/edge），并先关闭该浏览器再提取。"
+                )
 
             # 创建任务
             task_id = self.task_counter
