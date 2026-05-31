@@ -52,6 +52,19 @@ def find_ffmpeg_location():
     return None  # 交给PATH
 
 
+def normalize_url(url):
+    """把一些平台的非标准链接转成yt-dlp能识别的标准格式。
+    主要解决抖音网页版用浮层(modal)打开视频、地址栏停留在搜索/精选页的问题：
+    douyin.com/jingxuan?modal_id=数字  ->  douyin.com/video/数字"""
+    url = url.strip()
+    # 抖音：从 modal_id 参数提取视频ID，转成标准 /video/ 链接
+    if "douyin.com" in url and "modal_id=" in url:
+        m = re.search(r'modal_id=(\d+)', url)
+        if m:
+            return f"https://www.douyin.com/video/{m.group(1)}"
+    return url
+
+
 class Config:
     """配置管理类 - 保存用户设置"""
     CONFIG_FILE = Path.home() / ".video_to_mp3_config.json"
@@ -869,6 +882,9 @@ class App:
                     continue
                 messagebox.showwarning("提示", f"无效的URL或文件不存在: {url}")
                 continue
+
+            # 规范化URL（如抖音 modal_id 浮层链接 -> 标准 /video/ 链接）
+            url = normalize_url(url)
 
             # 改进1：粘贴时检测非视频页（搜索/主页等），提前拦截
             bad = self.check_unsupported_page(url)
