@@ -1,0 +1,23 @@
+# 打包产物
+build/
+dist/
+*.spec.bak
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 捆绑的 ffmpeg（体积大，不入库）
+ffmpeg/
+
+# 本地配置
+.video_to_mp3_config.json
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

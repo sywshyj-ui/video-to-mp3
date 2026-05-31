@@ -1,0 +1,11 @@
+# 运行依赖
+yt-dlp>=2024.0.0
+
+# 可选：Windows 桌面通知（不装则静默跳过）
+# win10toast>=0.9
+
+# 可选：输入框拖拽URL支持（不装则用粘贴/回车）
+# tkinterdnd2>=0.3.0
+
+# 打包exe时需要（运行app.py本身不需要）
+# pyinstaller>=6.0
