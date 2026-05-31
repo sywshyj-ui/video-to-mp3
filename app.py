@@ -1,8 +1,8 @@
 # app.py
-# 在线视频转MP3工具 - 无需下载视频文件，仅提取音频流转码为MP3
-# 支持 YouTube / B站 / 抖音 / 微博 等上千平台，以及含视频的普通网页
-# 功能：可选音质(128/192/320kbps)、批量任务、登录cookies、嵌入封面元数据、
-#       全部清空/清除已完成、重试、打开目录、记住设置
+# 视频转MP3工具 - 在线视频(仅提取音频流，不下载视频)或本地视频文件提取音频
+# 支持 YouTube / B站 / 抖音 / 微博 等上千平台，含视频网页，以及本地视频文件
+# 功能：可选音质(128/192/320/V0)、多格式(mp3/m4a/opus/flac/wav)、批量任务、
+#       本地文件、登录cookies、嵌入封面、全部清空/清除已完成、重试、打开目录
 # 运行方式：
 # 1. pip install yt-dlp
 # 2. 确保 ffmpeg 在系统 PATH 中（https://ffmpeg.org/download.html）
@@ -212,7 +212,25 @@ class ExtractWorker(threading.Thread):
         self.final_path = None  # 由postprocessor_hook回填的最终文件路径
 
     def run(self):
-        """执行音频提取"""
+        """执行音频提取：本地文件走ffmpeg直转，在线URL走yt-dlp"""
+        try:
+            # 本地文件：直接用ffmpeg转码，无需yt-dlp，更快且离线可用
+            if self.is_local_file(self.task_item.url):
+                self.extract_local()
+                return
+            self.extract_online()
+        except Exception as e:
+            self.result_queue.put(('failed', self.task_item.task_id, self.friendly_error(str(e))))
+
+    @staticmethod
+    def is_local_file(path):
+        """判断是否为本地文件路径（非http/https且文件存在）"""
+        if path.startswith(('http://', 'https://')):
+            return False
+        return os.path.isfile(path)
+
+    def extract_online(self):
+        """从在线URL提取音频（yt-dlp）"""
         try:
             audio_format = self.options.get("audio_format", "mp3")
             quality = self.options.get("quality", "192")
@@ -292,6 +310,121 @@ class ExtractWorker(threading.Thread):
 
         except Exception as e:
             self.result_queue.put(('failed', self.task_item.task_id, self.friendly_error(str(e))))
+
+    def extract_local(self):
+        """从本地视频文件提取音频，直接调用ffmpeg转码"""
+        src = self.task_item.url
+        audio_format = self.options.get("audio_format", "mp3")
+        quality = self.options.get("quality", "192")
+        embed = self.options.get("embed_metadata", True)
+
+        # 显示文件名作为标题
+        title = self.sanitize_filename(os.path.splitext(os.path.basename(src))[0])
+        self.result_queue.put(('title', self.task_item.task_id, title))
+        self.result_queue.put(('status', self.task_item.task_id, '转码中...', 'blue'))
+
+        # best模式保留源音频编码(copy)，否则按所选格式
+        out_ext = audio_format if audio_format != "best" else "m4a"
+        out_path = self.unique_path(os.path.join(self.output_dir, f"{title}.{out_ext}"))
+
+        ffmpeg_exe = self.ffmpeg_exe_path()
+
+        # 组装ffmpeg命令：-vn去掉视频流，只保留音频
+        cmd = [ffmpeg_exe, '-y', '-i', src, '-vn']
+        cmd += self.audio_codec_args(audio_format, quality)
+        if embed:
+            cmd += ['-map_metadata', '0']  # 保留源文件的元数据标签
+        cmd += ['-progress', 'pipe:1', '-nostats', out_path]
+
+        # 先探测总时长，用于计算百分比进度
+        total_dur = self.probe_duration(src)
+
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, encoding='utf-8', errors='replace',
+            startupinfo=startupinfo
+        )
+
+        # 读取ffmpeg的-progress输出，解析out_time_ms换算进度
+        for line in proc.stdout:
+            if self.task_item.cancelled:
+                proc.terminate()
+                return
+            line = line.strip()
+            if line.startswith('out_time_ms=') and total_dur > 0:
+                try:
+                    cur = int(line.split('=', 1)[1]) / 1_000_000  # 微秒->秒
+                    pct = min(cur / total_dur * 100, 99)
+                    self.result_queue.put(('progress', self.task_item.task_id, pct))
+                except (ValueError, ZeroDivisionError):
+                    pass
+        proc.wait()
+
+        if proc.returncode == 0 and os.path.exists(out_path):
+            self.result_queue.put(('completed', self.task_item.task_id, out_path))
+        else:
+            self.result_queue.put(('failed', self.task_item.task_id, 'ffmpeg转码失败'))
+
+    def audio_codec_args(self, audio_format, quality):
+        """根据格式返回ffmpeg音频编码参数"""
+        if audio_format == "best":
+            return ['-acodec', 'copy']        # 直接拷贝音频流，零损失零转码
+        if audio_format == "mp3":
+            if quality == "0":                # V0 最佳VBR
+                return ['-acodec', 'libmp3lame', '-q:a', '0']
+            return ['-acodec', 'libmp3lame', '-b:a', f'{quality}k']
+        if audio_format == "m4a":
+            return ['-acodec', 'aac', '-b:a', f'{quality}k']
+        if audio_format == "opus":
+            return ['-acodec', 'libopus', '-b:a', f'{quality}k']
+        if audio_format == "flac":
+            return ['-acodec', 'flac']        # 无损
+        if audio_format == "wav":
+            return ['-acodec', 'pcm_s16le']   # 无损PCM
+        return ['-acodec', 'libmp3lame', '-b:a', '192k']
+
+    def probe_duration(self, src):
+        """用ffprobe探测媒体总时长(秒)，失败返回0"""
+        ffmpeg_exe = self.ffmpeg_exe_path()
+        ffprobe = os.path.join(os.path.dirname(ffmpeg_exe), 'ffprobe.exe' if sys.platform == "win32" else 'ffprobe')
+        if not os.path.isfile(ffprobe):
+            ffprobe = 'ffprobe'  # 回退PATH
+        startupinfo = None
+        if sys.platform == "win32":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        try:
+            out = subprocess.run(
+                [ffprobe, '-v', 'quiet', '-show_entries', 'format=duration',
+                 '-of', 'default=noprint_wrappers=1:nokey=1', src],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                universal_newlines=True, encoding='utf-8', errors='replace',
+                startupinfo=startupinfo
+            )
+            return float(out.stdout.strip())
+        except (ValueError, subprocess.SubprocessError):
+            return 0
+
+    def ffmpeg_exe_path(self):
+        """返回ffmpeg可执行文件完整路径（捆绑目录或PATH）"""
+        loc = self.options.get("ffmpeg_location")
+        exe = 'ffmpeg.exe' if sys.platform == "win32" else 'ffmpeg'
+        return os.path.join(loc, exe) if loc else exe
+
+    def unique_path(self, path):
+        """目标文件已存在时自动加序号：song.mp3 -> song (1).mp3"""
+        if not os.path.exists(path):
+            return path
+        base, ext = os.path.splitext(path)
+        i = 1
+        while os.path.exists(f"{base} ({i}){ext}"):
+            i += 1
+        return f"{base} ({i}){ext}"
 
     def friendly_error(self, raw):
         """把yt-dlp的常见英文报错转成可操作的中文提示"""
@@ -473,8 +606,12 @@ class App:
         self.extract_btn = ttk.Button(input_frame, text="开始提取", command=self.add_task)
         self.extract_btn.pack(side="left")
 
+        # 选择本地视频文件按钮
+        self.local_btn = ttk.Button(input_frame, text="本地视频...", command=self.add_local_files)
+        self.local_btn.pack(side="left", padx=(5, 0))
+
         # 提示文本
-        hint_text = "支持 YouTube、B站、抖音、微博等上千平台及含视频的网页 | 可粘贴多个URL（每行一个）"
+        hint_text = "支持 YouTube、B站、抖音、微博等上千平台及含视频的网页 | 在线URL或本地文件均可"
         ttk.Label(top_frame, text=hint_text, font=("Arial", 8), foreground="gray").pack(anchor="w", pady=(3, 0))
 
         # 工具栏：批量操作按钮
@@ -645,6 +782,34 @@ class App:
         Config.save(self.config)
         self.update_status("设置已保存")
 
+    def spawn_task(self, source):
+        """创建任务并启动后台工作线程（在线URL或本地文件路径通用）"""
+        task_id = self.task_counter
+        self.task_counter += 1
+        task_item = TaskItem(self.scrollable_frame, source, task_id, app=self)
+        self.tasks[task_id] = task_item
+        # 快照当前选项，确保任务期间设置变化不影响已派发任务
+        worker = ExtractWorker(task_item, self.output_dir, self.result_queue, self.current_options())
+        worker.start()
+
+    def add_local_files(self):
+        """选择本地视频文件并加入提取队列"""
+        files = filedialog.askopenfilenames(
+            title="选择本地视频文件",
+            initialdir=self.output_dir,
+            filetypes=[
+                ("视频文件", "*.mp4 *.mkv *.avi *.mov *.flv *.wmv *.webm *.m4v *.ts *.mpg *.mpeg *.3gp"),
+                ("音频文件", "*.m4a *.aac *.wav *.flac *.ogg *.opus *.wma"),
+                ("所有文件", "*.*"),
+            ]
+        )
+        if not files:
+            return
+        for path in files:
+            self.spawn_task(path)
+            self.update_status(f"已添加本地文件: {os.path.basename(path)}")
+        self.root.after(100, lambda: self.canvas.yview_moveto(1.0))
+
     def check_unsupported_page(self, url):
         """检测明显不是单个视频页的URL（搜索/用户主页等），返回提示文字或None"""
         low = url.lower()
@@ -694,9 +859,15 @@ class App:
 
         cookie_warned = False  # 同一批只提醒一次cookies
         for url in urls:
-            # 验证URL格式
+            # 本地文件路径：直接加入队列（ffmpeg直转）
             if not url.startswith(('http://', 'https://')):
-                messagebox.showwarning("提示", f"无效的URL: {url}")
+                # 去掉可能的 file:// 前缀和引号
+                local = url.replace('file:///', '').replace('file://', '').strip('"')
+                if os.path.isfile(local):
+                    self.spawn_task(local)
+                    self.update_status(f"已添加本地文件: {os.path.basename(local)}")
+                    continue
+                messagebox.showwarning("提示", f"无效的URL或文件不存在: {url}")
                 continue
 
             # 改进1：粘贴时检测非视频页（搜索/主页等），提前拦截
@@ -721,17 +892,8 @@ class App:
                     "（如 chrome/edge），并先关闭该浏览器再提取。"
                 )
 
-            # 创建任务
-            task_id = self.task_counter
-            self.task_counter += 1
-
-            task_item = TaskItem(self.scrollable_frame, url, task_id, app=self)
-            self.tasks[task_id] = task_item
-
-            # 启动工作线程（快照当前选项，确保任务期间设置变化不影响已派发任务）
-            worker = ExtractWorker(task_item, self.output_dir, self.result_queue, self.current_options())
-            worker.start()
-
+            # 在线URL：创建任务并启动
+            self.spawn_task(url)
             self.update_status(f"已添加任务: {url[:50]}...")
 
         # 清空输入框
