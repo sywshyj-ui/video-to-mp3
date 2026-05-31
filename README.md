@@ -4,7 +4,15 @@
 
 支持 YouTube、B站、抖音、微博、Twitter/X 等 1800+ 平台，以及含视频的普通网页。
 
-## 直接运行（开发模式）
+## 下载使用（开箱即用）
+
+到 [Releases](https://github.com/sywshyj-ui/video-to-mp3/releases) 下载 `video-to-mp3-with-ffmpeg.exe`，
+双击即可运行——**已内置 ffmpeg，无需另外安装任何东西**（也不需要 Python）。
+
+> 体积约 100MB，因为捆绑了 ffmpeg/ffprobe。首次启动稍慢（onefile 需解压）属正常。
+> 若想要不含 ffmpeg 的精简版（约 30MB，需系统自备 ffmpeg），见旧版 Release。
+
+## 从源码运行（开发模式）
 
 ```bash
 pip install yt-dlp
@@ -12,7 +20,7 @@ pip install yt-dlp
 python app.py
 ```
 
-## 打包成 EXE（无需 Python 环境分发给他人）
+## 自行打包成 EXE
 
 ### 方式一：一键脚本（推荐）
 
